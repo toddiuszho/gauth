@@ -1,10 +1,12 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-const google_auth_library_1 = require("google-auth-library");
 const iap_1 = require("@google-cloud/iap");
 const resource_manager_1 = require("@google-cloud/resource-manager");
-const util_1 = require("util");
+const google_auth_library_1 = require("google-auth-library");
 const path_1 = require("path");
+const util_1 = require("util");
+const yargs = require("yargs");
+const helpers_1 = require("yargs/helpers");
 const RETRY_CONFIG = {
     httpMethodsToRetry: ['GET', 'PUT', 'POST', 'HEAD', 'OPTIONS', 'DELETE'],
 };
@@ -49,15 +51,20 @@ async function fetchEmail(auth) {
     const headers = {
         Authorization: `Bearer ${accessToken}`,
     };
-    const res = await auth.request({
-        headers,
-        retry: true,
-        retryConfig: RETRY_CONFIG,
-        url,
-    });
-    return res.data.email;
+    try {
+        const res = await auth.request({
+            headers,
+            retry: true,
+            retryConfig: RETRY_CONFIG,
+            url,
+        });
+        return res.data.email;
+    }
+    catch (error) {
+        console.error((0, util_1.inspect)({ fetchEmailError: error }, { colors: true, depth: 4 }));
+        return '';
+    }
 }
-const cachedAuthorizationHeaderValue = { expiresInMilliseconds: 0, payload: '' };
 function assert(union, entity, context) {
     if (!union)
         throw {
@@ -68,20 +75,28 @@ function assert(union, entity, context) {
     return union;
 }
 async function createIdTokenProvider(createOptions) {
-    const { projectId, targetPrincipal } = createOptions;
+    const { projectId, targetAudience, targetPrincipal } = createOptions;
     // const auth = new GoogleAuth<OAuth2Client>({
     const auth = new google_auth_library_1.GoogleAuth({
         projectId,
         scopes: ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/userinfo.email'],
     });
     const sourceClient = await auth.getClient();
-    if (targetPrincipal)
+    if (targetPrincipal) {
+        console.dir({ providerType: 'impersonation', targetPrincipal });
         return new google_auth_library_1.Impersonated({
             projectId,
             sourceClient,
             targetPrincipal,
             targetScopes: ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/userinfo.email'],
         });
+    }
+    if (!isManagedRuntime()) {
+        console.dir({ providerType: 'adc/gcloud' });
+        process.exitCode = 1;
+        throw { type: 'illegal-access/iap-local', title: 'Forbidden IAP from local', message: 'Use impersonation' };
+    }
+    console.dir({ providerType: 'managed' });
     const credentials = await auth.getCredentials();
     try {
         const client_email = credentials.client_email || (sourceClient instanceof google_auth_library_1.JWT ? sourceClient.email : undefined) || (await fetchEmail(auth));
@@ -106,19 +121,26 @@ async function init(initOpts) {
     const [clients] = await iapClient.listIdentityAwareProxyClients({ parent: (0, path_1.join)(iapClient.projectPath(projectId), 'brands', projectNumber) });
     const appEngineClient = assert(clients.find(value => value.displayName === 'IAP-App-Engine-app'), 'IdentityAwareProxyOAuthServiceClient.find["IAP-App-Engine-app"]');
     const targetAudience = appEngineClient.name.split('/').pop();
-    return [await createIdTokenProvider({ projectId, targetPrincipal }), targetAudience];
+    return [await createIdTokenProvider({ projectId, targetAudience, targetPrincipal }), targetAudience];
 }
-async function dumpToken(provider, targetAudience) {
-    const token = await provider.fetchIdToken(targetAudience, { includeEmail: true });
-    console.dir({ token });
+function isManagedRuntime() {
+    const env = process.env;
+    return !!(env.GOOGLE_CLOUD_REGION || env.GAE_SERVICE);
 }
 async function main(args) {
-    const targetPrincipal = args.length < 0 ? undefined : args[0];
+    const parser = yargs(args)
+        .options({
+        'target-principal': { type: 'string', require: false, description: 'impersonate a service account' },
+    })
+        .version('1.0')
+        .strictOptions(true);
+    const argv = await parser.parseAsync();
+    const { targetPrincipal } = argv;
     const [provider, targetAudience] = await init({ targetPrincipal });
     const token = await provider.fetchIdToken(targetAudience, { includeEmail: true });
     console.dir({ token });
 }
-main(process.argv.slice(2))
+main((0, helpers_1.hideBin)(process.argv))
     .then(() => console.log('DONE'))
     .catch(error => {
     console.error((0, util_1.inspect)({ ERROR: error }, { colors: true, depth: 4 }));

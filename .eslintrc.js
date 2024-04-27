@@ -15,7 +15,7 @@ module.exports = {
       },
       rules: {
         '@typescript-eslint/no-explicit-any': 'warn',
-        'no-console': 'error',
+        'no-console': 'off',
         'no-underscore-dangle': 'off',
         '@typescript-eslint/no-non-null-assertion': 'off',
         '@typescript-eslint/dot-notation': 'off',

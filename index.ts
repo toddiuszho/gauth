@@ -1,13 +1,10 @@
-import {AuthClient, Compute, GoogleAuth, Impersonated, JWT} from 'google-auth-library'
 import {IdentityAwareProxyOAuthServiceClient} from '@google-cloud/iap'
 import {ProjectsClient} from '@google-cloud/resource-manager'
-import {inspect} from 'util'
+import {AuthClient, Compute, GoogleAuth, Impersonated, JWT} from 'google-auth-library'
 import {join} from 'path'
-
-type CacheEntry<T> = {
-  expiresInMilliseconds: number
-  payload: T
-}
+import {inspect} from 'util'
+import * as yargs from 'yargs'
+import {hideBin} from 'yargs/helpers'
 
 const RETRY_CONFIG = {
   httpMethodsToRetry: ['GET', 'PUT', 'POST', 'HEAD', 'OPTIONS', 'DELETE'],
@@ -90,16 +87,19 @@ async function fetchEmail(auth: GoogleAuth<JSONClient>): Promise<string> {
   const headers = {
     Authorization: `Bearer ${accessToken}`,
   }
-  const res = await auth.request<FetchUserInfoResponse>({
-    headers,
-    retry: true,
-    retryConfig: RETRY_CONFIG,
-    url,
-  })
-  return res.data.email
+  try {
+    const res = await auth.request<FetchUserInfoResponse>({
+      headers,
+      retry: true,
+      retryConfig: RETRY_CONFIG,
+      url,
+    })
+    return res.data.email
+  } catch (error: unknown) {
+    console.error(inspect({fetchEmailError: error}, {colors: true, depth: 4}))
+    return ''
+  }
 }
-
-const cachedAuthorizationHeaderValue: CacheEntry<string> = {expiresInMilliseconds: 0, payload: ''}
 
 function assert<T>(union: T | undefined, entity: string, context?: any): T {
   if (!union)
@@ -112,8 +112,12 @@ function assert<T>(union: T | undefined, entity: string, context?: any): T {
   return union
 }
 
-async function createIdTokenProvider(createOptions: {projectId: string; targetPrincipal?: string}): Promise<IEnhancedIdTokenProvider> {
-  const {projectId, targetPrincipal} = createOptions
+async function createIdTokenProvider(createOptions: {
+  projectId: string
+  targetAudience: string
+  targetPrincipal?: string
+}): Promise<IEnhancedIdTokenProvider> {
+  const {projectId, targetAudience, targetPrincipal} = createOptions
   // const auth = new GoogleAuth<OAuth2Client>({
   const auth = new GoogleAuth<JSONClient>({
     projectId,
@@ -122,20 +126,29 @@ async function createIdTokenProvider(createOptions: {projectId: string; targetPr
 
   const sourceClient = await auth.getClient()
 
-  if (targetPrincipal)
+  if (targetPrincipal) {
+    console.dir({providerType: 'impersonation', targetPrincipal})
     return new Impersonated({
       projectId,
       sourceClient,
       targetPrincipal,
       targetScopes: ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/userinfo.email'],
     })
+  }
 
+  if (!isManagedRuntime()) {
+    console.dir({providerType: 'adc/gcloud'})
+    process.exitCode = 1
+    throw {type: 'illegal-access/iap-local', title: 'Forbidden IAP from local', message: 'Use impersonation'}
+  }
+
+  console.dir({providerType: 'managed'})
   const credentials = await auth.getCredentials()
   try {
     const client_email =
       credentials.client_email || (sourceClient instanceof JWT ? (sourceClient as JWT).email : undefined) || (await fetchEmail(auth))
     return new DefaultEnhancedIdTokenProvider({sourceClient, client_email})
-  } catch (error: any) {
+  } catch (error: unknown) {
     throw {
       type: 'service-account/not-found',
       title: 'Impersonation Needed',
@@ -158,22 +171,29 @@ async function init(initOpts: {targetPrincipal?: string}): Promise<[IEnhancedIdT
     'IdentityAwareProxyOAuthServiceClient.find["IAP-App-Engine-app"]'
   )
   const targetAudience = (appEngineClient.name as string).split('/').pop()!
-  return [await createIdTokenProvider({projectId, targetPrincipal}), targetAudience]
+  return [await createIdTokenProvider({projectId, targetAudience, targetPrincipal}), targetAudience]
 }
 
-async function dumpToken(provider: IEnhancedIdTokenProvider, targetAudience: string): Promise<void> {
-  const token = await provider.fetchIdToken(targetAudience, {includeEmail: true})
-  console.dir({token})
+function isManagedRuntime(): boolean {
+  const env = process.env
+  return !!(env.GOOGLE_CLOUD_REGION || env.GAE_SERVICE)
 }
 
 async function main(args: string[]): Promise<void> {
-  const targetPrincipal = args.length < 0 ? undefined : args[0]
+  const parser = yargs(args)
+    .options({
+      'target-principal': {type: 'string', require: false, description: 'impersonate a service account'},
+    })
+    .version('1.0')
+    .strictOptions(true)
+  const argv = await parser.parseAsync()
+  const {targetPrincipal} = argv
   const [provider, targetAudience] = await init({targetPrincipal})
   const token = await provider.fetchIdToken(targetAudience, {includeEmail: true})
   console.dir({token})
 }
 
-main(process.argv.slice(2))
+main(hideBin(process.argv))
   .then(() => console.log('DONE'))
   .catch(error => {
     console.error(inspect({ERROR: error}, {colors: true, depth: 4}))

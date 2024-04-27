@@ -12,3 +12,7 @@
 #!.yarn/cache
 .pnp.*
 node_modules
+
+*.js
+*.js.map
+
